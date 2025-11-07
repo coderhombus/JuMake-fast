@@ -1,132 +1,273 @@
-// scr/initialize_git.rs
+// OLD
+// // src/initialize_git.rs
+
+//! Module responsible for initializing a Git repository for a JuMake project.
+//! Handles `.gitignore`, adding all files, JUCE submodule linking, and initial commit.
+
 use crate::context::Context;
-use git2::{
-    build::CheckoutBuilder, Error, FetchOptions, IndexAddOption, RemoteCallbacks, Repository,
-    Signature,
-};
+use dialoguer::Input;
+use dirs;
+use git2::{Error as GitError, IndexAddOption, Repository, Signature};
+use log::{info, warn};
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::path::Path;
-// Initialize the Git repository
-pub fn initialize_git_repo(context: &Context) {
-    println!("Initializing Git repository...");
-    match Repository::init(&context.project_path) {
-        Ok(repo) => {
-            println!("Git repository initialized successfully.");
+use std::path::{Path, PathBuf};
+use thiserror::Error;
 
-            let mut gitignore_file = OpenOptions::new()
-                .append(true)
-                .create(true)
-                .open(context.project_path.join(".gitignore"))
-                .expect("Failed to open .gitignore file");
+#[cfg(windows)]
+use std::os::windows::fs as windows_fs;
 
-            writeln!(gitignore_file, "modules/").expect("Failed to write to .gitignore");
-            writeln!(gitignore_file, "jumake_build/").expect("Failed to write to .gitignore");
-            writeln!(gitignore_file, "build/").expect("Failed to write to .gitignore");
-            writeln!(gitignore_file, "compile_commands.json").expect("Failed to write to .gitignore");
-            writeln!(gitignore_file, ".jumake").expect("Failed to write to .gitignore");
-            // Add all files to the repository (excluding the submodule)
-            if let Err(e) = add_all_files_to_repo(&repo) {
-                eprintln!("Error adding files to Git index: {}", e);
-                return;
-            }
+// ------------------------
+// Error type
+// ------------------------
+#[derive(Debug, Error)]
+pub enum JuMakeError {
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
 
-            // Add JUCE as a submodule
-            if let Err(e) = add_juce_submodule(context) {
-                eprintln!("Error adding JUCE submodule: {}", e);
-                return;
-            }
+    #[error("Git error: {0}")]
+    Git(#[from] git2::Error),
 
-            // Stage the .gitmodules file
-            let mut index = repo.index().expect("Failed to get Git index");
-            index
-                .add_path(Path::new(".gitmodules"))
-                .expect("Failed to add .gitmodules to index");
-            index.write().expect("Failed to write Git index");
-        }
-        Err(e) => eprintln!("Failed to initialize Git repository: {}", e),
-    }
+    #[error("Configuration error: {0}")]
+    Config(String),
+
+    #[error("TOML parse error: {0}")]
+    TomlDe(#[from] toml::de::Error),
+
+    #[error("TOML serialization error: {0}")]
+    TomlSer(#[from] toml::ser::Error),
+
+    #[error("Dialoguer error: {0}")]
+    Dialoguer(#[from] dialoguer::Error),
+
+    #[error("Symlink error from {src} to {dst}: {source}")]
+    Symlink {
+        src: String,
+        dst: String,
+        #[source]
+        source: std::io::Error,
+    },
 }
-fn add_juce_submodule(context: &Context) -> Result<(), Box<dyn std::error::Error>> {
-    let modules_path = context.project_path.join("modules");
-    fs::create_dir_all(&modules_path)?;
 
-    let juce_path = modules_path.join("JUCE");
-    let submodule_url = "https://github.com/juce-framework/JUCE.git";
+// ------------------------
+// Configuration handling
+// ------------------------
+#[derive(Serialize, Deserialize, Default)]
+struct JuMakeConfig {
+    juce_path: Option<PathBuf>,
+}
 
-    if !juce_path.exists() {
-        println!("Cloning JUCE from GitHub... this may take some minutes. Please be patient!");
+/// Retrieves JUCE path from cached configuration or prompts the user.
+pub fn get_juce_path() -> Result<PathBuf, JuMakeError> {
+    // Platform-specific cache directory
+    let cache_dir = dirs::cache_dir()
+        .ok_or_else(|| JuMakeError::Config("Could not determine cache directory".into()))?
+        .join("jumake");
 
-        let repo = Repository::open(&context.project_path)?;
+    fs::create_dir_all(&cache_dir)?;
+    let config_file = cache_dir.join("config.toml");
 
-        // Set checkout to false to prevent automatic checkout of main branch
-        let mut submodule = repo.submodule(submodule_url, Path::new("modules/JUCE"), false)?;
-        submodule.init(true)?;
-
-        let submodule_repo = submodule.open()?;
-
-        // Set up remote callbacks for verbose output
-        let mut remote_callbacks = RemoteCallbacks::new();
-        let mut last_progress = 0;
-
-        remote_callbacks.transfer_progress(move |stats| {
-            if stats.received_objects() != last_progress {
-                last_progress = stats.received_objects();
-                print!(
-                    "\rReceived {}/{} objects ({} bytes)",
-                    stats.received_objects(),
-                    stats.total_objects(),
-                    stats.received_bytes()
-                );
-                std::io::stdout().flush().unwrap();
-            }
-            true
-        });
-
-        // Fetch all branches with verbose output
-        let mut fetch_options = FetchOptions::new();
-        fetch_options.remote_callbacks(remote_callbacks);
-        fetch_options.download_tags(git2::AutotagOption::All);
-
-        submodule_repo.find_remote("origin")?.fetch(
-            &["+refs/heads/*:refs/remotes/origin/*"],
-            Some(&mut fetch_options),
-            None,
-        )?;
-        println!("\nFetched all branches");
-
-        // Checkout the master branch explicitly
-        let (object, reference) = submodule_repo.revparse_ext("refs/remotes/origin/master")?;
-        submodule_repo.checkout_tree(&object, Some(CheckoutBuilder::default().force()))?;
-        submodule_repo.set_head(reference.unwrap().name().unwrap())?;
-
-        println!("JUCE cloned successfully");
+    // Load existing config or create default
+    let mut config: JuMakeConfig = if config_file.exists() {
+        let content = fs::read_to_string(&config_file)?;
+        toml::from_str(&content)?
     } else {
-        println!("JUCE already exists, skipping clone.");
+        JuMakeConfig::default()
+    };
+
+    // Prompt if JUCE path is missing
+    if config.juce_path.is_none() {
+        let input_path: String = Input::new()
+            .with_prompt("Enter path to your local JUCE folder")
+            .validate_with(|input: &String| -> Result<(), &str> {
+                let p = Path::new(input);
+                if p.exists() && p.is_dir() {
+                    Ok(())
+                } else {
+                    Err("Path does not exist or is not a directory")
+                }
+            })
+            .interact_text()?;
+
+        let pathbuf = PathBuf::from(input_path);
+
+        // Atomic write to avoid corrupt config
+        let tmp_file = config_file.with_extension("tmp");
+        fs::write(&tmp_file, toml::to_string(&JuMakeConfig { juce_path: Some(pathbuf.clone()) })?)?;
+        fs::rename(&tmp_file, &config_file)?;
+
+        config.juce_path = Some(pathbuf);
+        info!("✅ JUCE path saved to {}", config_file.display());
+    } else {
+        info!("Using cached JUCE path from {}", config_file.display());
+    }
+
+    // Return the JUCE path as a PathBuf
+    Ok(config.juce_path.expect("JUCE path must be set"))
+}
+
+// ------------------------
+// Git repository initialization
+// ------------------------
+pub fn initialize_git_repo(context: &Context) -> Result<(), JuMakeError> {
+    info!("Initializing Git repository at {}", context.project_path.display());
+
+    let repo = Repository::init(&context.project_path)?;
+    info!("Git repository initialized successfully.");
+
+    append_gitignore(&context.project_path)?;
+    add_all_files_to_repo(&repo)?;
+    add_juce_submodule(context)?;
+
+    // Handle .gitmodules staging
+    let gitmodules_path = context.project_path.join(".gitmodules");
+    if gitmodules_path.exists() {
+        let mut index = repo.index()?;
+        if let Err(e) = index.add_path(Path::new(".gitmodules")) {
+            warn!(
+                "⚠️  .gitmodules file detected but could not be staged: {}",
+                e
+            );
+        } else {
+            info!("✅ .gitmodules file successfully staged.");
+            index.write()?;
+        }
+    } else {
+        info!("No .gitmodules file found — skipping stage step.");
     }
 
     Ok(())
 }
 
-// Add all files to the Git repository index
-fn add_all_files_to_repo(repo: &Repository) -> Result<(), Error> {
+// ------------------------
+// .gitignore handling with atomic writes
+// ------------------------
+const DEFAULT_GITIGNORE: &[&str] = &[
+    "modules/",
+    "jumake_build/",
+    "build/",
+    "compile_commands.json",
+    ".jumake",
+];
+
+fn append_gitignore(project_path: &Path) -> Result<(), JuMakeError> {
+    let gitignore_path = project_path.join(".gitignore");
+
+    // Read existing content safely
+    let existing = if gitignore_path.exists() {
+        fs::read_to_string(&gitignore_path)?
+    } else {
+        String::new()
+    };
+
+    // Prepare new content to append
+    let mut new_content = String::new();
+    for entry in DEFAULT_GITIGNORE {
+        if !existing.contains(entry) {
+            new_content.push_str(entry);
+            new_content.push('\n');
+        }
+    }
+
+    if !new_content.is_empty() {
+        // Atomic write to avoid corrupt .gitignore
+        let tmp_path = gitignore_path.with_extension("tmp");
+        fs::write(&tmp_path, format!("{}{}", existing, new_content))?;
+        fs::rename(&tmp_path, &gitignore_path)?;
+        info!("✅ Updated .gitignore at {}", gitignore_path.display());
+    } else {
+        info!("No new entries to add to .gitignore");
+    }
+
+    Ok(())
+}
+
+// ------------------------
+// Add JUCE submodule (cross-platform symlink)
+// ------------------------
+fn add_juce_submodule(context: &Context) -> Result<(), JuMakeError> {
+    let juce_path = get_juce_path()?;
+    if !juce_path.exists() || !juce_path.is_dir() {
+        return Err(JuMakeError::Config(format!(
+            "Local JUCE folder does not exist or is not a directory: {}",
+            juce_path.display()
+        )));
+    }
+
+    let modules_path = context.project_path.join("modules");
+    fs::create_dir_all(&modules_path)?;
+    let juce_link = modules_path.join("JUCE");
+
+    if juce_link.exists() {
+        match fs::read_link(&juce_link) {
+            Ok(existing_target) if existing_target == juce_path => {
+                info!("JUCE symlink already correct: {} → {}", juce_link.display(), juce_path.display());
+                return Ok(());
+            }
+            Ok(_) | Err(_) => {
+                warn!("Replacing existing JUCE link/folder at {}", juce_link.display());
+                if juce_link.is_dir() {
+                    fs::remove_dir_all(&juce_link)?;
+                } else {
+                    fs::remove_file(&juce_link)?;
+                }
+            }
+        }
+    }
+
+    info!("Creating symlink from {} → {}", juce_path.display(), juce_link.display());
+    create_symlink(&juce_path, &juce_link)?;
+    info!("✅ Linked JUCE to {}", juce_link.display());
+
+    Ok(())
+}
+
+// ------------------------
+// Cross-platform symlink creation
+// ------------------------
+#[cfg(unix)]
+fn create_symlink(src: &Path, dst: &Path) -> Result<(), JuMakeError> {
+    std::os::unix::fs::symlink(src, dst).map_err(|source| JuMakeError::Symlink {
+        src: src.display().to_string(),
+        dst: dst.display().to_string(),
+        source,
+    })
+}
+
+#[cfg(windows)]
+fn create_symlink(src: &Path, dst: &Path) -> Result<(), JuMakeError> {
+    windows_fs::symlink_dir(src, dst).map_err(|source| JuMakeError::Symlink {
+        src: src.display().to_string(),
+        dst: dst.display().to_string(),
+        source,
+    })
+}
+
+// ------------------------
+// Add all files to Git index
+// ------------------------
+fn add_all_files_to_repo(repo: &Repository) -> Result<(), GitError> {
     let mut index = repo.index()?;
     index.add_all(["*"].iter(), IndexAddOption::DEFAULT, None)?;
     index.write()?;
     Ok(())
 }
 
-// Create the initial commit
-
-pub fn create_initial_commit(context: &Context) -> Result<(), Error> {
+// ------------------------
+// Initial commit
+// ------------------------
+pub fn create_initial_commit(context: &Context) -> Result<(), JuMakeError> {
     let repo = Repository::open(&context.project_path)?;
     let signature = Signature::now("JuMake", "jumake@example.com")?;
+
     let tree_id = {
         let mut index = repo.index()?;
         index.write_tree()?
     };
     let tree = repo.find_tree(tree_id)?;
+
     let commit_id = repo.commit(
         Some("HEAD"),
         &signature,
@@ -135,6 +276,7 @@ pub fn create_initial_commit(context: &Context) -> Result<(), Error> {
         &tree,
         &[],
     )?;
-    println!("Initial commit created with id: {}", commit_id);
+
+    info!("✅ Initial commit created (id: {})", commit_id);
     Ok(())
 }

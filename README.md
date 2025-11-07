@@ -1,5 +1,14 @@
 # JuMake: CMake Project Initialization for JUCE
 
+## My Additions
+
+Control verbosity like this:
+```bash
+RUST_LOG=info cargo run -- new MyProject
+RUST_LOG=debug cargo run -- build
+```
+
+
 ## Overview
 
 JuMake is a command-line tool designed to simplify and accelerate the process of setting up new JUCE projects using CMake. It automates the creation of project structures, initializes Git repositories, clones the JUCE framework as a submodule, allowing developers to focus on their core audio application development rather than project setup logistics.

@@ -5,6 +5,8 @@ use std::fs;
 use std::process::{Command, Stdio};
 use std::error::Error;
 use std::str;
+// use std::path::Path;
+use which::which; // <--- import the function
 
 pub fn build_project(context: &Context) -> Result<(), Box<dyn std::error::Error>> {
 println!("Building project '{}'...", context.project_name);
@@ -14,25 +16,60 @@ println!("in '{}'...", context.build_type);
 let build_dir = context.project_path.join("jumake_build"); // New build directory name
 fs::create_dir_all(&build_dir)?;
 
+// Prefer Ninja if installed
+let generator = if Command::new("ninja").output().is_ok() {
+    "Ninja"
+} else {
+    "Unix Makefiles"
+};
+
 // Run CMake to generate the build files
-let cmake_status = Command::new("cmake")
-    .arg("..")
-    .arg(format!("-DCMAKE_BUILD_TYPE={}", context.build_type))
-    .arg("-DCMAKE_EXPORT_COMPILE_COMMANDS=ON")
-    .current_dir(&build_dir)
-    .stdout(Stdio::inherit())
-    .stderr(Stdio::inherit())
-    .status()?;
-if !cmake_status.success() {
-    return Err("CMake configure failed".into());
+let cmake_cache = build_dir.join("CMakeCache.txt");
+if !cmake_cache.exists() {
+    println!("Running CMake configuration...");
+
+    let ccache_available = which("ccache").is_ok();
+    if ccache_available {
+        println!("⚡ Detected ccache — enabling compiler caching!");
+    } else {
+        println!("⚠️  ccache not found — building without compiler cache.");
+    }
+
+    let mut cmake_cmd = Command::new("cmake");
+    cmake_cmd
+        .arg("..")
+        .arg(format!("-G{}", generator)) // use the generator here
+        .arg(format!("-DCMAKE_BUILD_TYPE={}", context.build_type))
+        .arg("-DCMAKE_EXPORT_COMPILE_COMMANDS=ON");
+
+    if ccache_available {
+        cmake_cmd
+            .arg("-DCMAKE_C_COMPILER_LAUNCHER=ccache")
+            .arg("-DCMAKE_CXX_COMPILER_LAUNCHER=ccache");
+    }
+
+    let cmake_status = cmake_cmd
+        .current_dir(&build_dir)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()?;
+    
+        if !cmake_status.success() {
+        return Err("CMake configure failed".into());
+    }
+} else {
+    println!("CMake already configured, skipping configure step...");
 }
 
 // Run CMake to build the project
+let num_cpus = num_cpus::get();
 let build_status = Command::new("cmake")
     .arg("--build")
     .arg(".")
     .arg("--config")
     .arg(format!("{}", context.build_type))
+    .arg("--parallel")
+    .arg(num_cpus.to_string())
     .current_dir(&build_dir)
     .stdout(Stdio::inherit())
     .stderr(Stdio::inherit())
