@@ -1,6 +1,4 @@
-// OLD
-// // src/initialize_git.rs
-
+// src/initialize_gir.rs
 //! Module responsible for initializing a Git repository for a JuMake project.
 //! Handles `.gitignore`, adding all files, JUCE submodule linking, and initial commit.
 
@@ -11,8 +9,6 @@ use git2::{Error as GitError, IndexAddOption, Repository, Signature};
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -20,7 +16,7 @@ use thiserror::Error;
 use std::os::windows::fs as windows_fs;
 
 // ------------------------
-// Error type
+// Custom error type
 // ------------------------
 #[derive(Debug, Error)]
 pub enum JuMakeError {
@@ -60,28 +56,28 @@ struct JuMakeConfig {
 }
 
 /// Retrieves JUCE path from cached configuration or prompts the user.
+/// Writes the path atomically to prevent config corruption.
 pub fn get_juce_path() -> Result<PathBuf, JuMakeError> {
     // Platform-specific cache directory
     let cache_dir = dirs::cache_dir()
-        .ok_or_else(|| JuMakeError::Config("Could not determine cache directory".into()))?
+        .ok_or_else(|| JuMakeError::Config("Cannot determine cache directory".into()))?
         .join("jumake");
 
     fs::create_dir_all(&cache_dir)?;
     let config_file = cache_dir.join("config.toml");
 
-    // Load existing config or create default
+    // Load or initialize config
     let mut config: JuMakeConfig = if config_file.exists() {
-        let content = fs::read_to_string(&config_file)?;
-        toml::from_str(&content)?
+        toml::from_str(&fs::read_to_string(&config_file)?)?
     } else {
         JuMakeConfig::default()
     };
 
-    // Prompt if JUCE path is missing
+    // Prompt user if JUCE path is missing
     if config.juce_path.is_none() {
         let input_path: String = Input::new()
             .with_prompt("Enter path to your local JUCE folder")
-            .validate_with(|input: &String| -> Result<(), &str> {
+            .validate_with(|input: &String| {
                 let p = Path::new(input);
                 if p.exists() && p.is_dir() {
                     Ok(())
@@ -91,7 +87,7 @@ pub fn get_juce_path() -> Result<PathBuf, JuMakeError> {
             })
             .interact_text()?;
 
-        let pathbuf = PathBuf::from(input_path);
+        let pathbuf = PathBuf::from(&input_path);
 
         // Atomic write to avoid corrupt config
         let tmp_file = config_file.with_extension("tmp");
@@ -104,7 +100,6 @@ pub fn get_juce_path() -> Result<PathBuf, JuMakeError> {
         info!("Using cached JUCE path from {}", config_file.display());
     }
 
-    // Return the JUCE path as a PathBuf
     Ok(config.juce_path.expect("JUCE path must be set"))
 }
 
@@ -121,18 +116,22 @@ pub fn initialize_git_repo(context: &Context) -> Result<(), JuMakeError> {
     add_all_files_to_repo(&repo)?;
     add_juce_submodule(context)?;
 
-    // Handle .gitmodules staging
-    let gitmodules_path = context.project_path.join(".gitmodules");
+    stage_gitmodules_if_exists(&repo, &context.project_path)?;
+
+    Ok(())
+}
+
+/// Stages `.gitmodules` if it exists
+fn stage_gitmodules_if_exists(repo: &Repository, project_path: &Path) -> Result<(), JuMakeError> {
+    let gitmodules_path = project_path.join(".gitmodules");
+
     if gitmodules_path.exists() {
-        let mut index = repo.index()?;
-        if let Err(e) = index.add_path(Path::new(".gitmodules")) {
-            warn!(
-                "⚠️  .gitmodules file detected but could not be staged: {}",
-                e
-            );
-        } else {
-            info!("✅ .gitmodules file successfully staged.");
-            index.write()?;
+        match repo.index().and_then(|mut idx| { 
+            idx.add_path(Path::new(".gitmodules"))?;
+            idx.write() 
+        }) {
+            Ok(_) => info!("✅ .gitmodules file successfully staged."),
+            Err(e) => warn!("⚠️  .gitmodules exists but could not be staged: {}", e),
         }
     } else {
         info!("No .gitmodules file found — skipping stage step.");
@@ -142,7 +141,7 @@ pub fn initialize_git_repo(context: &Context) -> Result<(), JuMakeError> {
 }
 
 // ------------------------
-// .gitignore handling with atomic writes
+// .gitignore handling
 // ------------------------
 const DEFAULT_GITIGNORE: &[&str] = &[
     "modules/",
@@ -150,31 +149,22 @@ const DEFAULT_GITIGNORE: &[&str] = &[
     "build/",
     "compile_commands.json",
     ".jumake",
+    ".cache/",
 ];
 
 fn append_gitignore(project_path: &Path) -> Result<(), JuMakeError> {
     let gitignore_path = project_path.join(".gitignore");
+    let existing = fs::read_to_string(&gitignore_path).unwrap_or_default();
 
-    // Read existing content safely
-    let existing = if gitignore_path.exists() {
-        fs::read_to_string(&gitignore_path)?
-    } else {
-        String::new()
-    };
+    let new_entries: String = DEFAULT_GITIGNORE
+        .iter()
+        .filter(|entry| !existing.contains(*entry))
+        .map(|entry| format!("{}\n", entry))
+        .collect();
 
-    // Prepare new content to append
-    let mut new_content = String::new();
-    for entry in DEFAULT_GITIGNORE {
-        if !existing.contains(entry) {
-            new_content.push_str(entry);
-            new_content.push('\n');
-        }
-    }
-
-    if !new_content.is_empty() {
-        // Atomic write to avoid corrupt .gitignore
+    if !new_entries.is_empty() {
         let tmp_path = gitignore_path.with_extension("tmp");
-        fs::write(&tmp_path, format!("{}{}", existing, new_content))?;
+        fs::write(&tmp_path, format!("{}{}", existing, new_entries))?;
         fs::rename(&tmp_path, &gitignore_path)?;
         info!("✅ Updated .gitignore at {}", gitignore_path.display());
     } else {
@@ -189,9 +179,9 @@ fn append_gitignore(project_path: &Path) -> Result<(), JuMakeError> {
 // ------------------------
 fn add_juce_submodule(context: &Context) -> Result<(), JuMakeError> {
     let juce_path = get_juce_path()?;
-    if !juce_path.exists() || !juce_path.is_dir() {
+    if !juce_path.is_dir() {
         return Err(JuMakeError::Config(format!(
-            "Local JUCE folder does not exist or is not a directory: {}",
+            "Local JUCE folder does not exist: {}",
             juce_path.display()
         )));
     }
@@ -200,13 +190,14 @@ fn add_juce_submodule(context: &Context) -> Result<(), JuMakeError> {
     fs::create_dir_all(&modules_path)?;
     let juce_link = modules_path.join("JUCE");
 
+    // Remove existing incorrect symlink or folder
     if juce_link.exists() {
         match fs::read_link(&juce_link) {
             Ok(existing_target) if existing_target == juce_path => {
                 info!("JUCE symlink already correct: {} → {}", juce_link.display(), juce_path.display());
                 return Ok(());
             }
-            Ok(_) | Err(_) => {
+            _ => {
                 warn!("Replacing existing JUCE link/folder at {}", juce_link.display());
                 if juce_link.is_dir() {
                     fs::remove_dir_all(&juce_link)?;
@@ -262,10 +253,7 @@ pub fn create_initial_commit(context: &Context) -> Result<(), JuMakeError> {
     let repo = Repository::open(&context.project_path)?;
     let signature = Signature::now("JuMake", "jumake@example.com")?;
 
-    let tree_id = {
-        let mut index = repo.index()?;
-        index.write_tree()?
-    };
+    let tree_id = repo.index()?.write_tree()?;
     let tree = repo.find_tree(tree_id)?;
 
     let commit_id = repo.commit(

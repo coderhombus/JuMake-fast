@@ -7,6 +7,8 @@ Control verbosity like this:
 RUST_LOG=info cargo run -- new MyProject
 RUST_LOG=debug cargo run -- build
 ```
+Build with:     cargo build --release
+Install with:   cargo install --path .
 
 
 ## Overview

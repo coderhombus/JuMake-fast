@@ -22,6 +22,7 @@ use context::Context;
 use create_project::create_project;
 use create_files::add_class;
 
+/// Main CLI parser
 #[derive(Parser)]
 #[command(
     author,
@@ -33,6 +34,7 @@ struct Cli {
     command: Commands,
 }
 
+/// CLI subcommands
 #[derive(Subcommand)]
 enum Commands {
     /// Create a new JUCE project
@@ -69,9 +71,10 @@ enum ElementType {
 }
 
 fn main() {
-    env_logger::init();
+    env_logger::init(); // Initialize logger
     let cli = Cli::parse();
 
+    // Execute selected command and handle errors gracefully
     if let Err(e) = match cli.command {
         Commands::New { project_name, path, template } => handle_new(project_name, path, template),
         Commands::Add { element_type, element_name } => handle_add(element_type, element_name),
@@ -87,12 +90,13 @@ fn main() {
 // ------------------------
 
 fn handle_new(project_name: String, path: Option<String>, template: Option<String>) -> Result<(), Box<dyn Error>> {
-    // Fix: ensure no duplication of project folder
+    // Determine project path
     let project_path = path
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().expect("Failed to get cwd"))
         .join(&project_name);
 
+    // Use provided template or prompt user
     let template_name = template.or_else(|| select_template());
 
     let context = Context {
@@ -109,8 +113,13 @@ fn handle_new(project_name: String, path: Option<String>, template: Option<Strin
 
 fn handle_add(element_type: ElementType, element_name: String) -> Result<(), Box<dyn Error>> {
     let context = current_context()?;
-    add_class(&context, &format!("{element_type:?}"), &element_name)?;
-    info!("✅ Added {}: {}", format!("{element_type:?}"), element_name);
+    // map the enum to the lowercase strings expected by add_class
+    let element_type_str = match element_type {
+        ElementType::Class => "class",
+        ElementType::Component => "component",
+    };
+    add_class(&context, element_type_str, &element_name)?;
+    info!("✅ Added {}: {}", element_type_str, element_name);
     Ok(())
 }
 
@@ -126,6 +135,7 @@ fn handle_build(build_type: String) -> Result<(), Box<dyn Error>> {
 
 fn handle_run(build_type: String) -> Result<(), Box<dyn Error>> {
     let project_path = std::env::current_dir()?;
+// Use last build type if requested
     let effective_build_type = if build_type == "LastUsed" {
         read_last_build_type(&project_path).unwrap_or_else(|| "Release".to_string())
     } else {
@@ -151,7 +161,7 @@ fn handle_run(build_type: String) -> Result<(), Box<dyn Error>> {
 // Helpers
 // ------------------------
 
-/// Returns a Context using current working directory
+/// Get current context using working directory
 fn current_context() -> Result<Context, Box<dyn Error>> {
     let project_path = std::env::current_dir()?;
     Ok(Context {
@@ -162,6 +172,7 @@ fn current_context() -> Result<Context, Box<dyn Error>> {
     })
 }
 
+/// Get current context with specified build type
 fn current_context_with_build(build_type: &str) -> Result<Context, Box<dyn Error>> {
     let project_path = std::env::current_dir()?;
     Ok(Context {
@@ -172,6 +183,7 @@ fn current_context_with_build(build_type: &str) -> Result<Context, Box<dyn Error
     })
 }
 
+/// Prompt user to select a template interactively
 fn select_template() -> Option<String> {
     let options = ["GuiApplication", "AudioPlugin", "ConsoleApp"];
     let selection = Select::with_theme(&ColorfulTheme::default())
@@ -183,6 +195,7 @@ fn select_template() -> Option<String> {
     Some(options[selection].to_string())
 }
 
+/// Validate build type string
 fn validate_build_type(build_type: &str) -> Result<(), String> {
     match build_type {
         "Debug" | "Release" | "RelWithDebInfo" | "MinSizeRel" => Ok(()),
@@ -193,14 +206,17 @@ fn validate_build_type(build_type: &str) -> Result<(), String> {
     }
 }
 
+/// Persist last used build type
 fn save_build_type(context: &Context) -> std::io::Result<()> {
     fs::write(context.project_path.join(".jumake"), &context.build_type)
 }
 
+/// Read last used build type
 fn read_last_build_type(project_path: &Path) -> Option<String> {
     fs::read_to_string(project_path.join(".jumake")).ok()
 }
 
+/// Determine template name from CMakeLists.txt
 fn determine_template_name(project_path: &Path) -> Option<String> {
     let cmakelists_path = project_path.join("src").join("CMakeLists.txt");
     if cmakelists_path.exists() {
@@ -213,6 +229,7 @@ fn determine_template_name(project_path: &Path) -> Option<String> {
     Some("GuiApplication".to_string())
 }
 
+/// Extract project name from CMakeLists.txt
 fn extract_project_name<P: AsRef<Path>>(cmake_file_path: P) -> Result<String, Box<dyn Error>> {
     let file = fs::File::open(cmake_file_path)?;
     for line in BufReader::new(file).lines() {
